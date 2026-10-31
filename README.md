@@ -9,10 +9,6 @@ local model in the decision path.
 | **One** | `POST /v1/systemone` | `clef` | Fast closed judgments — choice, score, yes/no. Answers from next-token probabilities, ~1 s. |
 | **Two** | `POST /v1/chat/completions` | `deepseek-v4.1-flash:1017` | Deep reasoning, long generation, multi-step work. |
 
-`sys12_status` still reports the local oMLX server, because knowing which models
-are resident is useful before a long local chat job. **It never routes a
-decision there.**
-
 ## The escalate contract
 
 A decision is a hint, not a verdict. Every answer says whether it stands:
@@ -102,8 +98,6 @@ Fatal errors (401/402/403/400) are never retried and never fall back.
 | `route_gate_threshold` | p(deep) escalation threshold | `0.5` | `SYS12_ROUTE_THRESHOLD` |
 | `decision_timeout` | System One timeout (s) | `60` | `SYS12_DECISION_TIMEOUT` |
 | `chat_timeout` | System Two timeout (s) | `300` | `SYS12_CHAT_TIMEOUT` |
-| `omlx.base_url` | local oMLX, for `status` only | `http://127.0.0.1:8000` | |
-| `omlx.api_key_file` | oMLX key file | `~/Library/Application Support/omlx/.env` | |
 
 ### The API key
 
@@ -127,14 +121,13 @@ not silently attempt an unauthenticated request.
 ## MCP
 
 Registered in `~/.cursor/mcp.json` as **`sys12`** (stdio via `run_mcp.sh`).
-Five tools, every name prefixed so nothing collides with another server:
+Four tools, every name prefixed so nothing collides with another server:
 
 | Tool | System | Purpose |
 |---|---|---|
 | `sys12_decide(state, questions, model?, images?, notes?)` | One | Closed judgment. `images` are base64, `data:` prefix optional. |
 | `sys12_ask(prompt, model?, system?, max_tokens?, temperature?)` | Two | Chat completion; returns `content`, `reasoning`, `usage`. |
 | `sys12_route(task, state?, questions?, threshold?)` | switch | Gate on One, escalate to Two when deep. |
-| `sys12_status()` | local | oMLX models and memory, plus the cloud routing. |
 | `sys12_browse(url, goal, max_steps?, form?, headless?, summarize?)` | One + Playwright | Navigate with One picking each step. Off unless `SYS12_ALLOW_BROWSE=1`. |
 
 Question specs (dict form; the server tolerates options placed beside `type`):
@@ -154,8 +147,6 @@ ordered labels), `choice` criteria given as a list (labels become `A`, `B`, `C`)
 ## CLI
 
 ```bash
-./venv/bin/python sys12.py status                    # oMLX models + memory + routing
-
 ./venv/bin/python sys12.py decide --state "Disk at 91%, logs biggest" \
     --q "clean:noul:yes-now|later" \
     --q "severity:score:low|medium|high"
@@ -214,7 +205,7 @@ Needs Playwright, system Chrome, and the bundled OCR helper
 ```bash
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
-./venv/bin/python -m unittest discover -s tests    # 39 tests, no network
+./venv/bin/python -m unittest discover -s tests    # 63 tests, no network
 ```
 
 Key: nothing to do on this Mac (Keychain `ollama-clef`). See above for a new one.
@@ -229,8 +220,8 @@ Run the MCP server manually:
 
 | File | Purpose |
 |---|---|
-| `sys12.py` | Core client + CLI (decide / ask / route / status / browse). |
-| `sys12_mcp.py` | FastMCP server (stdio) exposing the five prefixed tools. |
+| `sys12.py` | Core client + CLI (decide / ask / route / browse). |
+| `sys12_mcp.py` | FastMCP server (stdio) exposing the four prefixed tools. |
 | `browser.py` | System One-driven Playwright navigation loop. |
 | `autoplay.py` | Autonomous DOOM player demo. |
 | `ocr.swift` | Vision helper (`swiftc ocr.swift -o ocr`). |
@@ -238,12 +229,10 @@ Run the MCP server manually:
 | `config.json` | Models, endpoints, timeouts, key sources. |
 | `requirements.txt` | `fastmcp`; Playwright is an optional extra. |
 | `run_mcp.sh` | Launches the MCP server for Cursor. |
-| `tests/test_sys12.py` | 39 tests: escalate rule, fallback, redaction, shapes, routing, tool surface. |
+| `tests/test_sys12.py` | 63 tests: escalate rule, fallback, redaction, shapes, routing, tool surface. |
 
 ## Limits
 
-- `sys12_status` reports the **local oMLX** server only; cloud models are not
-  listed there.
 - `clef` is a decision model: it works through `/v1/systemone`, not as a chat
   model. A chat request to it returns 400 and does not fall back.
 - The chat fallback loses probability information, so it always escalates.

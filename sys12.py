@@ -21,7 +21,6 @@ CLI:
   sys12 decide --state "ctx" --q name:type:criteria[|criteria...] [--q ...] [--image PATH] [--json]
   sys12 ask "prompt" [--model M] [--max-tokens N] [--temperature T] [--json]
   sys12 route "task" [--state ctx] [--q ...] [--threshold P] [--json]
-  sys12 status [--json]
   sys12 browse URL --goal "..." [--max-steps N] [--form JSON] [--headless] [--summarize] [--json]
 """
 
@@ -56,10 +55,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "route_gate_threshold": 0.5,
     "decision_timeout": 60,
     "chat_timeout": 300,
-    "omlx": {
-        "base_url": "http://127.0.0.1:8000",
-        "api_key_file": "~/Library/Application Support/omlx/.env",
-    },
 }
 
 DECISION_PATH = "/v1/systemone"
@@ -243,11 +238,6 @@ def cloud_key(cfg: dict[str, Any] | None = None) -> str:
     )
 
 
-def omlx_key(cfg: dict[str, Any]) -> str:
-    return _key_from_file((cfg.get("omlx") or {}).get("api_key_file") or "",
-                          "OMLX_API_KEY")
-
-
 # --------------------------------------------------------------------------- http
 
 
@@ -276,25 +266,6 @@ def post_json(url: str, body: dict, token: str, timeout: float) -> dict:
         # through the chat fallback would only fail twice. 400 is a bad request.
         retryable = exc.code in {408, 409, 425, 429, 500, 502, 503, 504}
         raise UpstreamError(exc.code, f"HTTP {exc.code}: {detail}", retryable) from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        reason = getattr(exc, "reason", exc)
-        raise UpstreamError(None, str(reason), True) from exc
-    if not isinstance(payload, dict):
-        raise UpstreamError(None, "response was not a JSON object", True)
-    return payload
-
-
-def get_json(url: str, token: str, timeout: float) -> dict:
-    headers = {"accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.load(response)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")
-        raise UpstreamError(exc.code, f"HTTP {exc.code}: {detail}", False) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
         raise UpstreamError(None, str(reason), True) from exc
@@ -1076,57 +1047,6 @@ def route(
     }
 
 
-# --------------------------------------------------------------------------- status
-
-
-def status(cfg: dict[str, Any] | None = None, *, getter: Callable[..., dict] | None = None,
-           timeout: float = 10.0) -> dict[str, Any]:
-    """Report local oMLX state and the cloud routing. Reporting only.
-
-    oMLX is never used as a decision backend; this exists because knowing which
-    local models are resident is useful when choosing what to run in chat.
-    """
-    cfg = cfg or load_config()
-    omlx = cfg.get("omlx") or {}
-    base = (omlx.get("base_url") or "http://127.0.0.1:8000").rstrip("/")
-    runner = getter or get_json
-    report: dict[str, Any] = {
-        "cloud": {
-            "base_url": cloud_base(cfg),
-            "decision_model": decision_model(cfg),
-            "chat_model": chat_model(cfg),
-            "decision_path": DECISION_PATH,
-            "chat_path": CHAT_PATH,
-        },
-        "omlx": {"base_url": base, "reachable": False, "models": []},
-    }
-    try:
-        payload = runner(f"{base}/v1/models/status", omlx_key(cfg), timeout)
-    except (UpstreamError, Sys12Error) as exc:
-        report["omlx"]["error"] = _redact(str(getattr(exc, "detail", exc)), [])
-        return report
-    models = [
-        {
-            "alias": item.get("model_alias"),
-            "id": item.get("id"),
-            "loaded": item.get("loaded"),
-            "pinned": item.get("pinned"),
-            "is_default": item.get("is_default"),
-            "est_gb": round((item.get("estimated_size") or 0) / 1e9, 1),
-        }
-        for item in payload.get("models", [])
-    ]
-    report["omlx"].update({
-        "reachable": True,
-        "loaded_count": payload.get("loaded_count"),
-        "model_count": payload.get("model_count"),
-        "current_memory_gb": round((payload.get("current_model_memory") or 0) / 1e9, 1),
-        "ceiling_gb": round((payload.get("final_ceiling") or 0) / 1e9, 1),
-        "models": models,
-    })
-    return report
-
-
 # --------------------------------------------------------------------------- browse
 
 
@@ -1190,9 +1110,6 @@ def main() -> None:
     p.add_argument("--threshold", type=float, default=None)
     p.add_argument("--retries", type=int, default=None,
                    help="retries for a transient failure (0 disables, default 2)")
-    p.add_argument("--json", action="store_true")
-
-    p = sub.add_parser("status", help="oMLX models, memory, and cloud routing")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("browse", help="System One-driven browser navigation")
@@ -1290,22 +1207,6 @@ def _run(args, cfg: dict[str, Any], parser: argparse.ArgumentParser) -> None:
                 print((out["result"] or {}).get("content") or "(empty)")
             if out.get("escalate"):
                 print("    escalate: System One was unsure; decide in the chat")
-    elif args.cmd == "status":
-        out = status(cfg)
-        if args.json:
-            print(json.dumps(out, indent=2, ensure_ascii=False))
-        else:
-            cloud = out["cloud"]
-            print(f"cloud {cloud['base_url']}  one={cloud['decision_model']}  two={cloud['chat_model']}")
-            omlx = out["omlx"]
-            if not omlx["reachable"]:
-                print(f"oMLX {omlx['base_url']} unreachable: {omlx.get('error')}")
-            else:
-                print(f"oMLX loaded {omlx['loaded_count']}/{omlx['model_count']}  "
-                      f"memory {omlx['current_memory_gb']}GB / {omlx['ceiling_gb']}GB")
-                for model in omlx["models"]:
-                    mark = "●" if model["loaded"] else "○"
-                    print(f"  {mark} {model['alias'] or model['id']}  ({model['est_gb']}GB est)")
     elif args.cmd == "browse":
         form = json.loads(args.form) if args.form else None
         out = browse(cfg, args.url, args.goal, max_steps=args.max_steps,

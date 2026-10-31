@@ -41,7 +41,6 @@ def cfg(**overrides) -> dict:
         "route_gate_threshold": 0.5,
         "decision_timeout": 60,
         "chat_timeout": 300,
-        "omlx": {"base_url": "http://127.0.0.1:8000", "api_key_file": ""},
     }
     for key, value in overrides.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
@@ -399,31 +398,6 @@ class RouteTests(unittest.TestCase):
         self.assertTrue(out["escalate"])
 
 
-class StatusTests(unittest.TestCase):
-    def test_unreachable_omlx_is_reported_not_raised(self) -> None:
-        def getter(url, token, timeout):
-            raise sys12.UpstreamError(None, "connection refused", True)
-
-        report = sys12.status(cfg(), getter=getter)
-        self.assertFalse(report["omlx"]["reachable"])
-        self.assertIn("refused", report["omlx"]["error"])
-        self.assertEqual(report["cloud"]["decision_model"], "clef")
-
-    def test_loaded_models_are_summarized(self) -> None:
-        def getter(url, token, timeout):
-            return {"loaded_count": 1, "model_count": 3, "current_model_memory": 2e10,
-                    "final_ceiling": 48e9,
-                    "models": [{"model_alias": "Qwen Pi", "id": "x", "loaded": True,
-                                "pinned": False, "is_default": True,
-                                "estimated_size": 2e10}]}
-
-        report = sys12.status(cfg(), getter=getter)
-        self.assertTrue(report["omlx"]["reachable"])
-        self.assertEqual(report["omlx"]["loaded_count"], 1)
-        self.assertEqual(report["omlx"]["models"][0]["alias"], "Qwen Pi")
-        self.assertEqual(report["omlx"]["current_memory_gb"], 20.0)
-
-
 class KeyResolutionTests(unittest.TestCase):
     def test_environment_key_wins(self) -> None:
         with mock.patch.dict(os.environ, {"OLLAMA_API_KEY": "env-key"}):
@@ -723,7 +697,7 @@ class RetryTests(unittest.TestCase):
 
 
 class McpSurfaceTests(unittest.TestCase):
-    def test_server_exposes_five_prefixed_tools(self) -> None:
+    def test_server_exposes_the_prefixed_tools(self) -> None:
         import asyncio
 
         import sys12_mcp
@@ -732,7 +706,7 @@ class McpSurfaceTests(unittest.TestCase):
         names = sorted(tool.name for tool in tools)
         self.assertEqual(
             names,
-            ["sys12_ask", "sys12_browse", "sys12_decide", "sys12_route", "sys12_status"],
+            ["sys12_ask", "sys12_browse", "sys12_decide", "sys12_route"],
         )
         for tool in tools:
             self.assertTrue(tool.description, f"{tool.name} needs a description")

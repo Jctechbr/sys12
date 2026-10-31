@@ -5,7 +5,6 @@ Tools (all prefixed so they cannot collide with another server's tools):
   sys12_decide  → System One: choice / score / noul on Ollama Cloud
   sys12_ask     → System Two: chat completion on Ollama Cloud
   sys12_route   → the switch: NOUL gate on System One, escalate when deep
-  sys12_status  → local oMLX models and memory, plus the cloud routing
   sys12_browse  → browser navigation with System One picking each step
 
 Every decision carries the escalate contract: if ``escalate`` is true for a
@@ -180,24 +179,6 @@ def sys12_route(
     return _safe(
         sys12.route, task, state=state, questions=questions, threshold=threshold
     )
-
-
-@mcp.tool(
-    annotations={
-        "title": "oMLX and cloud status",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "openWorldHint": False,
-    }
-)
-def sys12_status() -> dict[str, Any]:
-    """Report local oMLX models and memory, plus the cloud routing.
-
-    oMLX is reporting only — it is not used as a decision backend. Useful before
-    starting a long local chat job: it shows which models are resident and how
-    much memory is left.
-    """
-    return _safe(sys12.status)
 
 
 _BROWSE_TRUTHY = {"1", "true", "yes", "on"}

@@ -9,9 +9,5 @@
   },
   "route_gate_threshold": 0.5,
   "decision_timeout": 60,
-  "chat_timeout": 300,
-  "omlx": {
-    "base_url": "http://127.0.0.1:8000",
-    "api_key_file": "~/Library/Application Support/omlx/.env"
-  }
+  "chat_timeout": 300
 }
