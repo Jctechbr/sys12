@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """sys12 browser — System One-driven navigation loop.
 
-System One (the configured decision model — local logits or a cloud
-chat-fallback) is non-generative: it classifies (choice/score/noul), so it
-cannot emit actions or text. The browse loop is therefore hybrid:
+System One (the cloud decision model) is non-generative: it classifies
+(choice/score/noul), so it cannot emit actions or text. The browse loop is
+therefore hybrid:
 
   - deterministic Playwright code  → observe (elements, page text) + execute
   - System One (sys12.decide)      → per-step choice: which element advances
@@ -22,7 +22,9 @@ from typing import Any
 import sys12
 
 SEL = "a, button, [role='button'], input:not([type='hidden']), select"
-MAX_CANDIDATES = 24  # 24 candidates + 2 stop options = 26 (System One's limit)
+# Candidates per step, plus two stop options. The cloud decision model accepts
+# 255 criteria, so the cap here is prompt size, not the model's limit.
+MAX_CANDIDATES = 48
 STOP_GOAL = "stop: the goal's answer is on this page"
 STOP_STUCK = "stop: nothing here can advance the goal"
 _SAMPLE_CHARS = 1200
@@ -232,6 +234,8 @@ def _decide(cfg: dict[str, Any], goal: str, obs: dict) -> tuple[str, str, float 
     )
     ans = out["answers"]["action"]
     letter = ans["choice"]
+    # An escalated answer is only a hint; the letter is still the best guess,
+    # so keep it and let the caller see the confidence.
     return letter, label_by_letter.get(letter, ""), ans.get("confidence")
 
 

@@ -1,161 +1,199 @@
 #!/usr/bin/env python3
-"""sys12 MCP server — System One / System Two switch as OpenCode tools.
+"""sys12 MCP server — the System One / System Two switch as MCP tools.
 
-Exposes:
-  decide(state, questions)  → System One (/v1/systemone): fast structured judgment
-  ask(prompt, ...)          → System Two (/v1/chat/completions): reasoning + generation
-  route(task, ...)          → the switch: gate on System One, escalate if deep
-  status()                  → local oMLX loaded models + memory
-  browse(url, goal, ...)    → System One-driven Playwright navigation
+Tools (all prefixed so they cannot collide with another server's tools):
+  sys12_decide  → System One: choice / score / noul on Ollama Cloud
+  sys12_ask     → System Two: chat completion on Ollama Cloud
+  sys12_route   → the switch: NOUL gate on System One, escalate when deep
+  sys12_status  → local oMLX models and memory, plus the cloud routing
+  sys12_browse  → browser navigation with System One picking each step
 
-Models listed in config.cloud.models route to Ollama Cloud; everything else
-route to the local oMLX server. Run via run_mcp.sh (stdio).
+Every decision carries the escalate contract: if ``escalate`` is true for a
+question, the label is a hint only and the caller decides. Decisions are cloud
+only; there is no local model in the decision path. Run via run_mcp.sh (stdio).
 """
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
 import sys12
 
-mcp = FastMCP("sys12")
+INSTRUCTIONS = (
+    "sys12 is a System One / System Two switch on Ollama Cloud. "
+    "sys12_decide gives a fast structured judgment (choice, score, yes/no) from "
+    "next-token probabilities in about a second. sys12_ask gives full reasoning and "
+    "generation. sys12_route picks between them with a gate question. "
+    "Always check the escalate flag: when it is true for a question, the returned "
+    "label is a hint only and you decide instead. Redact MAC addresses, IP addresses, "
+    "hostnames, and secrets before calling. A decision is not permission to change a system."
+)
+
+mcp = FastMCP("sys12", instructions=INSTRUCTIONS)
+
 CFG = sys12.load_config()
 
 
-def _safe(fn, *args, **kwargs):
-    """Run a sys12 call, returning {"error": ...} instead of crashing the server."""
+def _safe(call, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Run a sys12 call, returning {"error": ...} rather than crashing the server."""
     try:
-        return fn(*args, **kwargs)
-    except sys12.Sys12Error as e:
-        return {"error": str(e)}
+        return call(CFG, *args, **kwargs)
+    except sys12.Sys12Error as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # a browser or SDK failure must not kill the server
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
-_RESERVED = {"type", "instructions"}
-
-
-def _normalize_questions(questions: dict[str, Any]) -> dict[str, Any]:
-    """Tolerate common question-shape mistakes.
-
-    - options/true-false placed on the question instead of in `criteria`
-    - score given as a dict (values become the labels)
-    - choice given as a list (labels become A, B, C, ...)
-    """
-    out: dict[str, Any] = {}
-    for name, q in questions.items():
-        if not isinstance(q, dict):
-            out[name] = q
-            continue
-        q = dict(q)
-        if "criteria" not in q:
-            extra = {k: v for k, v in q.items() if k not in _RESERVED}
-            if extra:
-                q["criteria"] = extra  # works for noul {true, false} and choice {A: ...}
-                for k in extra:
-                    q.pop(k)
-        elif isinstance(q["criteria"], dict) and q.get("type") == "score":
-            q["criteria"] = list(q["criteria"].values())
-        elif isinstance(q["criteria"], list) and q.get("type") == "choice":
-            q["criteria"] = {chr(65 + i): c for i, c in enumerate(q["criteria"][:26])}
-        out[name] = q
-    return out
-
-
-@mcp.tool
-def decide(
+@mcp.tool(
+    annotations={
+        "title": "System One decision",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    }
+)
+def sys12_decide(
     state: str,
     questions: dict[str, Any],
     model: str | None = None,
     images: list[str] | None = None,
+    notes: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """System One: fast structured decision (~1s, no text generation).
+    """System One: a fast structured judgment in one forward pass.
 
-    Use when a quick judgment is needed: pick an option, score something,
-    or answer a yes/no. Answers come from next-token probabilities.
+    Use when a quick closed judgment is needed: pick an option, place something
+    on an ordered rubric, or answer yes/no. No text generation.
 
     Args:
-        state: Decision context — the situation, data, or task to judge.
-        questions: Mapping of question name to spec. Spec has a required
-            "type" ("choice" | "score" | "noul"), optional "instructions",
-            and "criteria": choice = {label: description} (up to 26),
-            score = [label, ...] (up to 26), noul = {"true": ..., "false": ...}.
-        model: Override the System One model (default from config).
-        images: Base64-encoded images (no data-URL prefix) for vision models.
+        state: The situation, data, or task to judge. Facts only.
+        questions: Mapping of question name to spec. Each spec needs
+            "type" ("choice" | "score" | "noul"), optional "instructions", and
+            "criteria": choice = {label: description}, score = [label, ...]
+            low to high, noul = {"true": ..., "false": ...}. Up to 255 criteria.
+        model: Override the decision model (default from config, cloud only).
+        images: Base64 images (a data: prefix is optional) for a vision model.
+        notes: One-line description per label, this call only. Nothing is stored.
 
     Returns:
-        answers keyed by question name: choice → chosen label + probabilities,
-        score → weighted score + legend, noul → p(true).
+        {"answers": {name: {...}}, "escalate": bool, "escalations": {...},
+         "backend", "model", "latency_ms", "fallback_reason", "usage"}.
+        Per answer: choice → choice, confidence, top; score → score, answer,
+        legend, confidence; noul → noul, answer, confidence.
+        Each answer has its own "escalate" and "escalate_reason". When escalate
+        is true, ignore the label and decide yourself.
     """
-    return _safe(sys12.decide, CFG, state, _normalize_questions(questions),
-                 model=model, images=images)
+    return _safe(sys12.decide, state, questions, model=model, images=images, notes=notes)
 
 
-@mcp.tool
-def ask(
+@mcp.tool(
+    annotations={
+        "title": "System Two chat",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    }
+)
+def sys12_ask(
     prompt: str,
     model: str | None = None,
     system: str | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
 ) -> dict[str, Any]:
-    """System Two: full reasoning and generation via chat completion.
+    """System Two: reasoning, long generation, and multi-step work.
 
-    Use for long reasoning, multi-step work, explanations, code, or any
-    task that needs a generated answer. Slower (seconds to minutes).
+    Use for explanations, code, plans, or any task that needs generated text.
+    Slower than sys12_decide (seconds to minutes).
 
     Args:
-        prompt: The task or question for the model.
-        model: Override the System Two model (default from config).
+        prompt: The task or question.
+        model: Override the chat model (default from config).
         system: Optional system prompt.
-        max_tokens: Optional output token cap.
+        max_tokens: Optional output cap. Set this whenever the reply is short.
         temperature: Optional sampling temperature.
 
     Returns:
-        {"model", "content", "reasoning" (if any), "usage"}.
+        {"model", "content", "reasoning", "usage"}.
     """
-    return _safe(sys12.ask, CFG, prompt, model=model, system=system,
-                 max_tokens=max_tokens, temperature=temperature)
+    return _safe(
+        sys12.ask, prompt, model=model, system=system,
+        max_tokens=max_tokens, temperature=temperature,
+    )
 
 
-@mcp.tool
-def route(
+@mcp.tool(
+    annotations={
+        "title": "System One/Two switch",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    }
+)
+def sys12_route(
     task: str,
     state: str | None = None,
     questions: dict[str, Any] | None = None,
     threshold: float | None = None,
 ) -> dict[str, Any]:
-    """The System One/Two switch: automatic per-task routing.
+    """The switch: gate on System One, then answer or escalate to System Two.
 
-    Asks System One a NOUL gate: "does this task need deep reasoning, long
-    generation, or multi-step work?" If p(deep) >= threshold (default from
-    config) the task escalates to System Two; otherwise the provided
-    structured questions are answered by System One (if none were provided,
-    only the gate verdict is returned).
+    System One is asked a gate question — "can this NOT be settled by a quick
+    structured judgment?" — and p(deep) at or above the threshold sends the task
+    to System Two. Below it, System One answers the structured questions. A
+    task with no questions goes straight to System Two, which costs one call less.
 
     Args:
         task: What must be decided or done.
-        state: Extra context (default: the task itself).
-        questions: Structured questions to answer with System One when the
-            gate says "simple" (same spec as decide()).
-        threshold: p(deep) escalation threshold, 0..1 (default from config).
+        state: Extra facts (default: none).
+        questions: Structured questions for System One when the gate says simple
+            (same spec as sys12_decide).
+        threshold: p(deep) escalation threshold 0..1 (default from config, 0.5).
 
     Returns:
-        {"system": "one"|"two", "gate": {p_deep, escalate, threshold}, "result"}.
+        {"system": "one"|"two", "gate": {p_deep, escalate, threshold, uncertain},
+         "result", "escalate"}. When system is "two", result is the chat reply.
+        When system is "one", result is a sys12_decide answer — check its escalate.
     """
-    return _safe(sys12.route, CFG, task, state=state,
-                 questions=_normalize_questions(questions) if questions else None,
-                 threshold=threshold)
+    return _safe(
+        sys12.route, task, state=state, questions=questions, threshold=threshold
+    )
 
 
-@mcp.tool
-def status() -> dict[str, Any]:
-    """oMLX server status: which models are loaded, memory usage."""
-    return _safe(sys12.status, CFG)
+@mcp.tool(
+    annotations={
+        "title": "oMLX and cloud status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    }
+)
+def sys12_status() -> dict[str, Any]:
+    """Report local oMLX models and memory, plus the cloud routing.
+
+    oMLX is reporting only — it is not used as a decision backend. Useful before
+    starting a long local chat job: it shows which models are resident and how
+    much memory is left.
+    """
+    return _safe(sys12.status)
 
 
-@mcp.tool
-def browse(
+@mcp.tool(
+    annotations={
+        "title": "System One browser navigation",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    }
+)
+def sys12_browse(
     url: str,
     goal: str,
     max_steps: int = 20,
@@ -163,33 +201,36 @@ def browse(
     headless: bool = False,
     summarize: bool = False,
 ) -> dict[str, Any]:
-    """Navigate a website with System One as the fast per-step decision maker.
+    """Navigate a website with System One choosing each step.
 
-    A tight in-process loop: Playwright observes the page and executes actions,
-    System One (~1 s, logits) picks which element advances the goal or signals
-    stop. Much faster than a 27B agent generating each step. One persistent
-    browser (system Chrome) is reused across calls, so cookies/login persist.
+    Playwright observes the page and executes actions; System One picks, per
+    step, which element advances the goal or signals stop. About one to three
+    seconds per step. One persistent browser is reused, so logins survive.
 
     Args:
         url: Starting URL.
-        goal: What to find or accomplish (drives element ranking + decisions).
+        goal: What to find or accomplish. Drives element ranking and decisions.
         max_steps: Safety cap on observe-decide-act iterations (default 20).
-        form: Optional mapping of input label → value, for inputs the model picks.
-        headless: Run Chrome hidden (default: visible window you can watch).
-        summarize: Also run System Two over the final page text to produce an answer.
+        form: Optional {input label: value} for form fields System One selects.
+        headless: Run the browser hidden (default: visible).
+        summarize: Also run System Two over the final page to answer the goal.
 
     Returns:
-        {status: goal_reached|stuck|max_steps|needs_input, stop_reason, steps,
-        url, title, text (truncated page content), answer? (if summarize)}.
+        {"status": goal_reached|stuck|max_steps|needs_input, "stop_reason",
+         "steps", "url", "title", "text", "answer"?}.
     """
-    import browser
-
-    try:
-        return browser.browse(CFG, url, goal, max_steps=max_steps, form=form,
-                              headless=headless, summarize=summarize)
-    except Exception as e:  # Playwright/oMLX failures must not kill the server
-        return {"error": f"{type(e).__name__}: {e}"}
+    if not os.environ.get("SYS12_ALLOW_BROWSE"):
+        return {
+            "error": (
+                "sys12_browse is disabled. Set SYS12_ALLOW_BROWSE=1 in the MCP "
+                "server environment and install the browser extra to enable it."
+            )
+        }
+    return _safe(
+        sys12.browse, url, goal, max_steps=max_steps, form=form,
+        headless=headless, summarize=summarize,
+    )
 
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="stdio")

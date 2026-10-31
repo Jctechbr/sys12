@@ -1,0 +1,6 @@
+fastmcp>=3.2,<4
+
+# Optional: needed only for sys12_browse (System One-driven navigation).
+# Install with:  ./venv/bin/pip install -r requirements.txt playwright
+#                ./venv/bin/playwright install chromium
+# playwright>=1.40
