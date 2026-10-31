@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Runtime output
+autoplay.log
+autoplay.out
+autoplay.jsonl
+
+# OCR helper build artifact (rebuild with: swiftc ocr.swift -o ocr)
+/ocr
+
+# Secrets — never commit
+.env
+*.env

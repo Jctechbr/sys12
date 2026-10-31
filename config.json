@@ -1,0 +1,18 @@
+{
+  "base_url": "http://127.0.0.1:8000",
+  "api_key_file": "~/Library/Application Support/omlx/.env",
+  "system1": "clef:cloud",
+  "system2": "deepseek-v4.1-flash:1017",
+  "route_gate_threshold": 0.5,
+  "systemone_timeout": 60,
+  "ask_timeout": 300,
+  "cloud": {
+    "base_url": "https://ollama.com",
+    "models": [
+      "clef:cloud",
+      "deepseek-v4.1-flash:1017"
+    ],
+    "api_key_env": "OLLAMA_API_KEY",
+    "api_key_file": "~/.config/sys12/ollama.env"
+  }
+}
