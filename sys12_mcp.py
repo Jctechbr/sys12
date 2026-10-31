@@ -159,8 +159,11 @@ def sys12_route(
 
     Returns:
         {"system": "one"|"two", "gate": {p_deep, escalate, threshold, uncertain},
-         "result", "escalate"}. When system is "two", result is the chat reply.
-        When system is "one", result is a sys12_decide answer — check its escalate.
+         "result", "escalate"}. The threshold alone decides the route;
+         gate.uncertain only reports that p(deep) sat inside 0.10-0.90, which is
+         common and is not itself a reason to escalate. When system is "two",
+         result is the chat reply. When system is "one", result is a sys12_decide
+         answer — check its escalate.
     """
     return _safe(
         sys12.route, task, state=state, questions=questions, threshold=threshold

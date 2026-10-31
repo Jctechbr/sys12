@@ -42,6 +42,10 @@ visible even when it escalates.
      answers in prose, using option text rather than letters.
    - otherwise → System One answers the structured questions.
 3. Returns `{system: "one"|"two", gate: {p_deep, escalate, threshold, uncertain}, result, escalate}`.
+   The threshold alone decides the route. `gate.uncertain` only reports that
+   p(deep) sat inside 0.10–0.90 — common on a yes/no gate, and not itself a
+   reason to escalate. `escalate` on the route is the *answer's* verdict, passed
+   up from System One when it answered; it is false when System Two answered.
 
 `sys12_decide` and `sys12_ask` call one system directly when the caller already
 knows which it wants.
