@@ -344,6 +344,7 @@ class RouteTests(unittest.TestCase):
                               transport=transport)
         self.assertEqual(out["system"], "one")
         self.assertFalse(out["gate"]["escalate"])
+        self.assertFalse(out["gate"]["degraded"])
         self.assertEqual(out["result"]["answers"]["q"]["choice"], "A")
         self.assertFalse(out["escalate"])
 
@@ -450,6 +451,156 @@ class KeyResolutionTests(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("OLLAMA_API_KEY", message)
         self.assertIn("gone", message)
+
+
+class RegressionTests(unittest.TestCase):
+    """Each test pins a defect found in the audit, so it cannot come back."""
+
+    def test_unparsed_fallback_answer_errors_instead_of_guessing(self) -> None:
+        # Was: a missing key became noul=0.0, escalate=False — a confident "no"
+        # the model never gave.
+        def transport(url, body, token, timeout):
+            if url.endswith("/v1/systemone"):
+                raise sys12.UpstreamError(503, "down", True)
+            return chat_reply('{"a": "A"}')
+
+        questions = {"a": {"type": "choice", "criteria": {"A": "x", "B": "y"}},
+                     "b": {"type": "noul"}}
+        with env_key():
+            with self.assertRaises(sys12.Sys12Error) as caught:
+                sys12.decide(cfg(), "s", questions, transport=transport)
+        self.assertIn("could not parse", str(caught.exception))
+        self.assertIn("b", str(caught.exception))
+
+    def test_null_noul_raises_a_typed_error_not_typeerror(self) -> None:
+        def transport(url, body, token, timeout):
+            return {"answers": {"q": {"type": "noul"}}}
+
+        with env_key():
+            with self.assertRaises(sys12.Sys12Error) as caught:
+                sys12.decide(cfg(), "x", {"q": {"type": "noul"}},
+                             transport=transport)
+        self.assertNotIsInstance(caught.exception, TypeError)
+        self.assertIn("non-numeric", str(caught.exception))
+
+    def test_non_retryable_upstream_error_keeps_its_status(self) -> None:
+        def transport(url, body, token, timeout):
+            raise sys12.UpstreamError(401, "bad key", False)
+
+        with env_key():
+            with self.assertRaises(sys12.UpstreamError) as caught:
+                sys12.decide(cfg(), "x",
+                             {"q": {"type": "choice",
+                                    "criteria": {"A": "x", "B": "y"}}},
+                             transport=transport)
+        self.assertEqual(caught.exception.status, 401)
+        self.assertFalse(caught.exception.retryable)
+
+    def test_bad_threshold_env_is_a_typed_error(self) -> None:
+        with mock.patch.dict(os.environ, {"SYS12_ROUTE_THRESHOLD": "abc"}):
+            with self.assertRaises(sys12.Sys12Error):
+                sys12.load_config()
+
+    def test_out_of_range_threshold_is_rejected(self) -> None:
+        with mock.patch.dict(os.environ, {"SYS12_ROUTE_THRESHOLD": "2.5"}):
+            with self.assertRaises(sys12.Sys12Error):
+                sys12.load_config()
+
+    def test_choice_options_may_share_a_description(self) -> None:
+        # Two options with the same text are legitimate; only keys must differ.
+        normalized = sys12.normalize_questions(
+            {"q": {"type": "choice", "criteria": {"A": "yes", "B": "yes"}}}
+        )
+        self.assertEqual(len(normalized["q"]["criteria"]), 2)
+
+    def test_duplicate_cli_criteria_are_rejected_not_silently_truncated(self) -> None:
+        with self.assertRaises(sys12.Sys12Error):
+            sys12.parse_question_spec("q:choice:a|a|b")
+
+    def test_cli_spec_over_the_cap_is_rejected(self) -> None:
+        spec = "q:choice:" + "|".join(f"o{i}" for i in range(300))
+        with self.assertRaises(sys12.Sys12Error):
+            sys12.parse_question_spec(spec)
+
+    def test_empty_chat_content_is_flagged(self) -> None:
+        def transport(url, body, token, timeout):
+            return {"model": "m", "choices": [{"message": {
+                "content": "", "reasoning": "thought a lot"}, "finish_reason": "length"}]}
+
+        with env_key():
+            out = sys12.ask(cfg(), "hi", transport=transport)
+        self.assertIn("empty_reason", out)
+        self.assertIn("max_tokens", out["empty_reason"])
+
+    def test_malformed_chat_response_raises_shape_error(self) -> None:
+        with env_key():
+            with self.assertRaises(sys12.ShapeError):
+                sys12.ask(cfg(), "hi", transport=lambda *a: {"nope": True})
+
+    def test_mcp_errors_are_typed(self) -> None:
+        import sys12_mcp
+
+        failed = mock.Mock(returncode=44, stdout="")
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch("subprocess.run", return_value=failed):
+            out = sys12_mcp.sys12_decide("s", {"q": {"type": "noul"}})
+        self.assertEqual(out["error_kind"], "input")
+
+    def test_emulated_parser_handles_real_model_reply_shapes(self) -> None:
+        qs = {"pick": {"type": "choice",
+                       "criteria": {"A": "canary", "B": "full rollout"}},
+              "ok": {"type": "noul"},
+              "sev": {"type": "score",
+                      "criteria": ["low", "medium", "high"]}}
+        cases = [
+            ('{"pick": "B", "ok": true, "sev": 2}',
+             ("B", 1.0, 0.5)),
+            ('{"pick": "(B)", "ok": "yes", "sev": "3"}',
+             ("B", 1.0, 1.0)),
+            ("```json\n{\"pick\": \"full rollout\", \"ok\": false, \"sev\": 1}\n```",
+             ("B", 0.0, 0.0)),
+            ('{"pick": "2", "ok": "no", "sev": 3}',
+             ("B", 0.0, 1.0)),
+        ]
+        for text, (letter, yes, score) in cases:
+            parsed = sys12._parse_emulated(qs, text)
+            self.assertEqual(parsed["pick"]["choice"], letter, text)
+            self.assertEqual(parsed["ok"]["noul"], yes, text)
+            self.assertEqual(parsed["sev"]["score"], score, text)
+
+    def test_emulated_parser_omits_unanswered_questions(self) -> None:
+        parsed = sys12._parse_emulated(
+            {"a": {"type": "choice", "criteria": {"A": "x", "B": "y"}},
+             "b": {"type": "noul"}},
+            '{"a": "A"}',
+        )
+        self.assertIn("a", parsed)
+        self.assertNotIn("b", parsed)
+
+    def test_emulated_parser_ignores_garbage(self) -> None:
+        for text in ("", "I cannot answer that.", '{"pick": "Z"}', '{"pick": null}'):
+            parsed = sys12._parse_emulated(
+                {"pick": {"type": "choice", "criteria": {"A": "x", "B": "y"}}}, text
+            )
+            self.assertEqual(parsed, {}, text)
+
+    def test_browser_stop_letters_cannot_collide_with_elements(self) -> None:
+        import browser
+
+        letters = set(browser._CANDIDATE_LETTERS)
+        self.assertNotIn(browser.STOP_GOAL_LETTER, letters)
+        self.assertNotIn(browser.STOP_STUCK_LETTER, letters)
+        # The old Y/Z choice collided once the cap passed 24.
+        self.assertLess(browser.MAX_CANDIDATES, len(browser._CANDIDATE_LETTERS) + 1)
+
+    def test_browser_bounds_max_steps(self) -> None:
+        import browser
+
+        with mock.patch.object(browser, "_ensure_page") as page:
+            page.return_value.goto.side_effect = RuntimeError("stop here")
+            with self.assertRaises(RuntimeError):
+                browser.browse(cfg(), "https://example.com", "goal", max_steps=0)
+        self.assertTrue(page.called, "max_steps=0 must still reach the page")
 
 
 class McpSurfaceTests(unittest.TestCase):

@@ -43,13 +43,25 @@ CFG = sys12.load_config()
 
 
 def _safe(call, *args: Any, **kwargs: Any) -> dict[str, Any]:
-    """Run a sys12 call, returning {"error": ...} rather than crashing the server."""
+    """Run a sys12 call, returning a typed error rather than crashing the server.
+
+    ``error_kind`` lets the caller tell a bad argument from an upstream failure:
+    ``input`` never retries, ``upstream`` may, ``internal`` means a bug here.
+    """
     try:
         return call(CFG, *args, **kwargs)
+    except sys12.UpstreamError as exc:
+        return {
+            "error": str(exc),
+            "error_kind": "upstream" if exc.retryable else "upstream_fatal",
+            "status": exc.status,
+        }
+    except sys12.ShapeError as exc:
+        return {"error": str(exc), "error_kind": "upstream_shape"}
     except sys12.Sys12Error as exc:
-        return {"error": str(exc)}
+        return {"error": str(exc), "error_kind": "input"}
     except Exception as exc:  # a browser or SDK failure must not kill the server
-        return {"error": f"{type(exc).__name__}: {exc}"}
+        return {"error": f"{type(exc).__name__}: {exc}", "error_kind": "internal"}
 
 
 @mcp.tool(

@@ -1,15 +1,26 @@
-import base64, subprocess, time
+import base64
+import subprocess
+import tempfile
+import time
 from pathlib import Path
+
 from playwright.sync_api import sync_playwright
-OCR = "/Users/networkze/AI_Projects/sys12/ocr"
-SHOT = Path("/private/var/folders/mr/3fc4llxd4wj17hqrd_5xfqyc0000gn/T/opencode/diag.png")
+
+HERE = Path(__file__).resolve().parent
+OCR = HERE / "ocr"
+SHOT = Path(tempfile.gettempdir()) / "sys12-diag.png"
 JS = """() => { const c=document.querySelector('canvas'); const o=document.createElement('canvas');
   o.width=c.width*3; o.height=c.height*3; const x=o.getContext('2d');
   x.imageSmoothingEnabled=false; x.drawImage(c,0,0,o.width,o.height); return o.toDataURL('image/png'); }"""
+
+
 def ocr(page, tag):
-    SHOT.write_bytes(base64.b64decode(page.evaluate(JS).split(",",1)[1]))
-    t = subprocess.run([OCR, str(SHOT)], capture_output=True, text=True, timeout=25).stdout
+    SHOT.write_bytes(base64.b64decode(page.evaluate(JS).split(",", 1)[1]))
+    t = subprocess.run([str(OCR), str(SHOT)], capture_output=True, text=True,
+                       timeout=25).stdout
     print(f"{tag}: {' '.join(t.split())[:150]}", flush=True)
+
+
 with sync_playwright() as pw:
     ctx = pw.chromium.launch_persistent_context(user_data_dir=str(Path.home()/"Library/Caches/sys12-chrome"),
         channel="chrome", headless=False, viewport={"width":1280,"height":900},

@@ -17,20 +17,29 @@ context is reused across calls so cookies/login survive between browse() calls.
 from __future__ import annotations
 
 import re
+import string
 from typing import Any
 
 import sys12
 
 SEL = "a, button, [role='button'], input:not([type='hidden']), select"
-# Candidates per step, plus two stop options. The cloud decision model accepts
-# 255 criteria, so the cap here is prompt size, not the model's limit.
-MAX_CANDIDATES = 48
+
 STOP_GOAL = "stop: the goal's answer is on this page"
 STOP_STUCK = "stop: nothing here can advance the goal"
 _SAMPLE_CHARS = 1200
 _TEXT_CHARS = 6000
 
 _STOPS = {STOP_GOAL, STOP_STUCK}
+
+# Element letters A, B, C ... come from ASCII; the two stop options live past
+# the candidate range so they can never collide with a real element letter
+# (Y and Z collided as soon as the candidate cap passed 24).
+_CANDIDATE_LETTERS = tuple(string.ascii_uppercase)
+STOP_GOAL_LETTER = "~goal"
+STOP_STUCK_LETTER = "~stuck"
+# Derive the cap from the letter space so the two can never drift apart:
+# a candidate the ranker keeps but _decide cannot letter is silently dropped.
+MAX_CANDIDATES = len(_CANDIDATE_LETTERS)
 
 _pw = None
 _browser = None
@@ -80,12 +89,18 @@ def _ensure_page(headless: bool = False):
 def close() -> None:
     """Close the persistent browser (call when done, e.g. at CLI exit)."""
     global _pw, _browser, _context, _page
-    if _browser is not None:
-        try:
+    try:
+        if _browser is not None:
             _browser.close()
-        finally:
-            _pw.stop()
-            _pw = _browser = _context = _page = None
+    except Exception:  # noqa: BLE001 - teardown must never raise
+        pass
+    finally:
+        try:
+            if _pw is not None:
+                _pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        _pw = _browser = _context = _page = None
 
 
 def _goal_keywords(goal: str) -> list[str]:
@@ -98,7 +113,7 @@ def _goal_keywords(goal: str) -> list[str]:
 def _rank(cands: list[dict], goal: str) -> list[dict]:
     """Deterministic pre-filter: keep the candidates most relevant to the goal.
 
-    System One can only see 26 options, so rank by keyword overlap (goal words
+    System One sees only the ranked head, so rank by keyword overlap (goal words
     in the element text) and keep the top MAX_CANDIDATES, tie-broken by DOM order.
     """
     kws = _goal_keywords(goal)
@@ -202,13 +217,15 @@ def _decide(cfg: dict[str, Any], goal: str, obs: dict) -> tuple[str, str, float 
     criteria: dict[str, str] = {}
     label_by_letter: dict[str, str] = {}
     for idx, c in enumerate(obs["candidates"]):
-        letter = chr(65 + idx)
+        if idx >= len(_CANDIDATE_LETTERS):
+            break
+        letter = _CANDIDATE_LETTERS[idx]
         criteria[letter] = c["label"]
         label_by_letter[letter] = c["label"]
-    criteria["Y"] = STOP_GOAL
-    criteria["Z"] = STOP_STUCK
-    label_by_letter["Y"] = STOP_GOAL
-    label_by_letter["Z"] = STOP_STUCK
+    criteria[STOP_GOAL_LETTER] = STOP_GOAL
+    criteria[STOP_STUCK_LETTER] = STOP_STUCK
+    label_by_letter[STOP_GOAL_LETTER] = STOP_GOAL
+    label_by_letter[STOP_STUCK_LETTER] = STOP_STUCK
 
     state = (
         f"Goal: {goal}\n"
@@ -236,7 +253,9 @@ def _decide(cfg: dict[str, Any], goal: str, obs: dict) -> tuple[str, str, float 
     letter = ans["choice"]
     # An escalated answer is only a hint; the letter is still the best guess,
     # so keep it and let the caller see the confidence.
-    return letter, label_by_letter.get(letter, ""), ans.get("confidence")
+    if letter is None:
+        return None, "", ans.get("confidence")
+    return str(letter), label_by_letter.get(letter, ""), ans.get("confidence")
 
 
 def _act(page, context, cand: dict | None, label: str, form: dict[str, str] | None) -> str:
@@ -367,6 +386,11 @@ def browse(
     Returns:
         {status, stop_reason, steps, url, title, text, answer?}
     """
+    if not str(url or "").strip():
+        raise sys12.Sys12Error("url is empty")
+    if not str(goal or "").strip():
+        raise sys12.Sys12Error("goal is empty")
+    max_steps = max(1, min(int(max_steps), 200))
     page = _ensure_page(headless=headless)
     page.goto(url, timeout=45000)
     page.wait_for_load_state("domcontentloaded", timeout=30000)
@@ -393,9 +417,18 @@ def browse(
             break
         seen_states.add(state_key)
         letter, label, conf = _decide(cfg, goal, obs)
+        if letter is None:
+            status = "stuck"
+            stop_reason = "no usable choice from the decision model"
+            steps.append({"step": step, "action": stop_reason, "confidence": conf})
+            break
         cand = None
-        if label not in _STOPS and 65 <= ord(letter) <= 65 + len(obs["candidates"]) - 1:
-            cand = obs["candidates"][ord(letter) - 65]
+        index = (
+            _CANDIDATE_LETTERS.index(letter)
+            if letter in _CANDIDATE_LETTERS else -1
+        )
+        if 0 <= index < len(obs["candidates"]):
+            cand = obs["candidates"][index]
         if label in _STOPS:
             status = "goal_reached" if label == STOP_GOAL else "stuck"
             stop_reason = label
@@ -403,7 +436,7 @@ def browse(
             break
         if cand is None:
             status = "stuck"
-            stop_reason = f"unresolvable choice '{label[:50]}'"
+            stop_reason = f"unresolvable choice '{str(label)[:50]}'"
             steps.append({"step": step, "action": stop_reason, "confidence": conf})
             break
         note = _act(cur, cur.context, cand, label, form)

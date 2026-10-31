@@ -121,20 +121,31 @@ class ShapeError(Sys12Error):
 # --------------------------------------------------------------------------- config
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise Sys12Error(f"{name}={raw!r} is not a number") from exc
+
+
 def load_config() -> dict[str, Any]:
     """Defaults, then config.json, then environment overrides."""
     cfg: dict[str, Any] = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
     if CONFIG_PATH.exists():
         try:
             loaded = json.loads(CONFIG_PATH.read_text())
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, OSError) as exc:
             print(f"warn: bad {CONFIG_PATH}: {exc}", file=sys.stderr)
         else:
-            for key, value in loaded.items():
-                if isinstance(value, dict) and isinstance(cfg.get(key), dict):
-                    cfg[key].update(value)
-                else:
-                    cfg[key] = value
+            if isinstance(loaded, dict):
+                for key, value in loaded.items():
+                    if isinstance(value, dict) and isinstance(cfg.get(key), dict):
+                        cfg[key].update(value)
+                    else:
+                        cfg[key] = value
     cloud = cfg["cloud"]
     for env_name, key in (
         ("SYS12_CLOUD_BASE_URL", "base_url"),
@@ -143,14 +154,23 @@ def load_config() -> dict[str, Any]:
     ):
         if os.environ.get(env_name):
             cloud[key] = os.environ[env_name]
-    for env_name, key in (
-        ("SYS12_ROUTE_THRESHOLD", "route_gate_threshold"),
-        ("SYS12_DECISION_TIMEOUT", "decision_timeout"),
-        ("SYS12_CHAT_TIMEOUT", "chat_timeout"),
-    ):
-        raw = os.environ.get(env_name, "").strip()
-        if raw:
-            cfg[key] = float(raw)
+    cfg["route_gate_threshold"] = _env_float(
+        "SYS12_ROUTE_THRESHOLD", float(cfg.get("route_gate_threshold") or 0.5)
+    )
+    cfg["decision_timeout"] = _env_float(
+        "SYS12_DECISION_TIMEOUT", float(cfg.get("decision_timeout") or 60)
+    )
+    cfg["chat_timeout"] = _env_float(
+        "SYS12_CHAT_TIMEOUT", float(cfg.get("chat_timeout") or 300)
+    )
+    if not 0.0 <= cfg["route_gate_threshold"] <= 1.0:
+        raise Sys12Error(
+            f"route_gate_threshold must be between 0 and 1, got "
+            f"{cfg['route_gate_threshold']}"
+        )
+    for key in ("decision_timeout", "chat_timeout"):
+        if cfg[key] <= 0:
+            raise Sys12Error(f"{key} must be positive, got {cfg[key]}")
     return cfg
 
 
@@ -351,7 +371,7 @@ def normalize_questions(questions: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(criteria, (list, tuple)):
                 raise Sys12Error(f"question '{name}': score needs an ordered list")
             labels = [str(c) for c in criteria]
-            _check_count(name, labels)
+            _check_count(name, labels, distinct=True)
             q["criteria"] = labels
         else:
             if isinstance(criteria, (list, tuple)):
@@ -361,7 +381,7 @@ def normalize_questions(questions: dict[str, Any]) -> dict[str, Any]:
                     f"question '{name}': choice needs a mapping of label to description"
                 )
             labels = [str(k) for k in criteria]
-            _check_count(name, labels)
+            _check_count(name, labels, distinct=False)
             q["criteria"] = {str(k): str(v) for k, v in criteria.items()}
 
         q["type"] = qtype
@@ -371,12 +391,18 @@ def normalize_questions(questions: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _check_count(name: str, labels: list[str]) -> None:
+def _check_count(name: str, labels: list[str], *, distinct: bool) -> None:
+    """Validate a criteria count and, for scores, that levels are distinct.
+
+    For a choice the keys are the labels and ``normalize_questions`` already
+    rejects duplicates via the dict; here ``labels`` holds the descriptions, so
+    two options may legitimately share text.
+    """
     if len(labels) < 2:
         raise Sys12Error(f"question '{name}' needs at least two criteria")
     if len(labels) > MAX_CRITERIA:
         raise Sys12Error(f"question '{name}' accepts at most {MAX_CRITERIA} criteria")
-    if len(set(labels)) != len(labels):
+    if distinct and len(set(labels)) != len(labels):
         raise Sys12Error(f"question '{name}' has duplicate criteria")
 
 
@@ -408,10 +434,18 @@ def parse_question_spec(spec: str) -> tuple[str, dict[str, Any]]:
     if not criteria:
         raise Sys12Error(f"empty criteria in '{spec}'")
     if qtype == "choice":
+        if len(criteria) > MAX_CRITERIA:
+            raise Sys12Error(f"choice accepts at most {MAX_CRITERIA} criteria: {spec}")
+        if len({c.casefold() for c in criteria}) != len(criteria):
+            raise Sys12Error(f"duplicate criteria in '{spec}'")
         return name, {"type": "choice",
-                      "criteria": {chr(65 + i): c for i, c in enumerate(criteria[:MAX_CRITERIA])}}
+                      "criteria": {chr(65 + i): c for i, c in enumerate(criteria)}}
     if qtype == "score":
-        return name, {"type": "score", "criteria": criteria[:MAX_CRITERIA]}
+        if len(criteria) > MAX_CRITERIA:
+            raise Sys12Error(f"score accepts at most {MAX_CRITERIA} criteria: {spec}")
+        if len({c.casefold() for c in criteria}) != len(criteria):
+            raise Sys12Error(f"duplicate criteria in '{spec}'")
+        return name, {"type": "score", "criteria": criteria}
     if qtype == "noul":
         if len(criteria) < 2:
             raise Sys12Error(f"noul needs two criteria: {spec}")
@@ -485,9 +519,17 @@ def _gate(qtype: str, answer: dict[str, Any]) -> tuple[bool, str | None]:
         return True, (
             "confidence missing (emulated answer has no probabilities); the chat model decides"
         )
-    unsure = float(confidence) < CHOICE_CONFIDENCE_MIN
+    try:
+        value = float(confidence)
+    except (TypeError, ValueError):
+        value = None
+    if value is None or value != value:
+        return True, (
+            f"confidence {confidence!r} is not a number; the chat model decides"
+        )
+    unsure = value < CHOICE_CONFIDENCE_MIN
     reason = (
-        f"confidence {float(confidence):.4f} is below {CHOICE_CONFIDENCE_MIN}; "
+        f"confidence {value:.4f} is below {CHOICE_CONFIDENCE_MIN}; "
         "the chat model decides"
         if unsure
         else None
@@ -510,6 +552,19 @@ def build_body(
     return body
 
 
+def _as_float(value: Any, name: str, field: str) -> float:
+    """Coerce a numeric answer field, raising ShapeError instead of TypeError."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ShapeError(
+            f"answer for '{name}' has a non-numeric {field}: {value!r}"
+        ) from exc
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ShapeError(f"answer for '{name}' has a non-finite {field}: {value!r}")
+    return number
+
+
 def _normalize_answers(
     payload: dict[str, Any],
     questions: dict[str, Any],
@@ -530,7 +585,7 @@ def _normalize_answers(
         qtype = question["type"]
         item: dict[str, Any]
         if qtype == "noul":
-            probability = float(answer.get("noul"))
+            probability = min(max(_as_float(answer.get("noul"), name, "noul"), 0.0), 1.0)
             item = {
                 "type": "noul",
                 "noul": round(probability, 4),
@@ -538,21 +593,29 @@ def _normalize_answers(
                 "confidence": None,
             }
         elif qtype == "choice":
+            choice = answer.get("choice")
+            if choice is not None:
+                choice = str(choice)
             probabilities = answer.get("probabilities") or {}
-            ranked = sorted(
-                probabilities.items(), key=lambda item: item[1], reverse=True
-            )[:3]
+            ranked: list[tuple[str, float]] = []
+            if isinstance(probabilities, dict):
+                for key, value in probabilities.items():
+                    try:
+                        ranked.append((str(key), float(value)))
+                    except (TypeError, ValueError):
+                        continue
+            ranked.sort(key=lambda pair: pair[1], reverse=True)
             item = {
                 "type": "choice",
-                "choice": answer.get("choice"),
+                "choice": choice,
                 "confidence": answer.get("confidence"),
                 "top": [
-                    {"option": key, "probability": round(float(value), 4)}
-                    for key, value in ranked
+                    {"option": key, "probability": round(value, 4)}
+                    for key, value in ranked[:3]
                 ],
             }
         else:
-            score = float(answer.get("score"))
+            score = _as_float(answer.get("score"), name, "score")
             legend = question["criteria"]
             index = max(0, min(len(legend) - 1, int(round(score))))
             item = {
@@ -636,6 +699,12 @@ def _decide_chat(
     elapsed = int((time.perf_counter() - started) * 1000)
     text = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     emulated = _parse_emulated(questions, text)
+    missing = [name for name in questions if name not in emulated]
+    if missing:
+        raise Sys12Error(
+            f"Cloud decision endpoint failed ({reason}); the chat fallback "
+            f"could not parse an answer for {missing} from: {text[:200]!r}"
+        )
     return _normalize_answers(
         {"answers": emulated, "usage": payload.get("usage")},
         questions,
@@ -647,7 +716,12 @@ def _decide_chat(
 
 
 def _parse_emulated(questions: dict[str, Any], text: str) -> dict[str, Any]:
-    """Parse a chat model's JSON reply into the /v1/systemone answer shape."""
+    """Parse a chat model's JSON reply into the /v1/systemone answer shape.
+
+    A question the reply does not cover is omitted from the result, so the
+    caller can report it. Inventing a label here would report a confident
+    answer the model never gave.
+    """
     cleaned = text.strip()
     fence = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.S)
     if fence:
@@ -664,42 +738,69 @@ def _parse_emulated(questions: dict[str, Any], text: str) -> dict[str, Any]:
     answers: dict[str, Any] = {}
     for name, question in questions.items():
         raw = parsed.get(name)
+        if raw is None:
+            continue  # unparsed: reported as an error, never guessed
         qtype = question["type"]
-        criteria = question["criteria"]
+        criteria = question.get("criteria") or {}
         if qtype == "choice":
             letter = None
             keys = [str(k) for k in criteria]
             if isinstance(raw, str):
-                value = raw.strip()
+                # Strip wrappers a chat model adds: "(B)", "B.", "'B'", "**B**".
+                value = raw.strip().strip("\"'`*()[]{}.,:;! ").strip()
                 if value in keys:
                     letter = value
                 elif any(key.casefold() == value.casefold() for key in keys):
                     letter = next(
                         key for key in keys if key.casefold() == value.casefold()
                     )
-                elif len(value) <= 2 and value[:1].upper() in keys:
-                    # A chat model often answers "B", "B." or "(B)".
-                    letter = value[:1].upper()
+                elif len(value) == 1 and value.upper() in keys:
+                    letter = value.upper()
+                elif value.isdigit():
+                    # Or a 1-based rank: 1 -> first option.
+                    index = int(value)
+                    if 1 <= index <= len(keys):
+                        letter = keys[index - 1]
                 else:
                     # Or it answers with the option text instead of the letter.
                     folded = value.casefold()
+                    best_key, best_len = None, 0
                     for key, description in criteria.items():
-                        text = str(description).casefold()
-                        if folded and text and (folded in text or text in folded):
-                            letter = str(key)
+                        label_text = str(description).casefold()
+                        if not folded or not label_text:
+                            continue
+                        if folded in label_text or label_text in folded:
+                            best_key, best_len = str(key), len(label_text)
                             break
-            elif isinstance(raw, int) and 0 <= raw < len(keys):
-                letter = keys[raw]
+                        # "full rollout" vs "full": score shared prefixes so a
+                        # paraphrase still resolves, longest match wins.
+                        prefix = len(os.path.commonprefix([folded, label_text]))
+                        if prefix >= 3 and prefix > best_len:
+                            best_key, best_len = str(key), prefix
+                    letter = best_key
+            elif isinstance(raw, int) and not isinstance(raw, bool):
+                if 0 <= raw < len(keys):
+                    letter = keys[raw]
+                elif 1 <= raw <= len(keys):
+                    letter = keys[raw - 1]
+            if letter is None:
+                continue
             answers[name] = {"type": "choice", "choice": letter,
                              "confidence": None, "probabilities": {}}
         elif qtype == "noul":
-            value = str(raw).strip().lower() if raw is not None else ""
-            trueish = raw is True or value.startswith(("t", "y", "1"))
+            if isinstance(raw, bool):
+                trueish = raw
+            else:
+                value = str(raw).strip().lower()
+                if not value:
+                    continue
+                trueish = value.startswith(("t", "y", "1"))
             answers[name] = {"type": "noul", "noul": 1.0 if trueish else 0.0}
         else:
             digits = re.sub(r"[^0-9]", "", str(raw))
-            number = int(digits) if digits else 0
-            bounded = min(max(number, 1), len(criteria))
+            if not digits:
+                continue
+            bounded = min(max(int(digits), 1), len(criteria))
             denominator = max(len(criteria) - 1, 1)
             answers[name] = {
                 "type": "score",
@@ -743,7 +844,9 @@ def decide(
         payload = _call(cfg, DECISION_PATH, body, timeout_value, transport)
     except UpstreamError as exc:
         if not exc.retryable:
-            raise Sys12Error(str(exc)) from None
+            # Keep the status and retryable flag: the caller needs to know this
+            # was a credential or request problem, not a transient failure.
+            raise exc from None
         return _decide_chat(
             cfg, state_text, prepared, timeout_value, images, transport,
             reason=str(exc), fallback_model=fallback_model,
@@ -790,13 +893,29 @@ def ask(
     payload = _call(
         cfg, CHAT_PATH, body, timeout or float(cfg.get("chat_timeout") or 300), transport
     )
-    message = ((payload.get("choices") or [{}])[0].get("message") or {})
-    return {
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ShapeError("chat response had no choices")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict):
+        raise ShapeError("chat response had no message")
+    content = message.get("content") or ""
+    reasoning = message.get("reasoning") or message.get("reasoning_content")
+    result = {
         "model": payload.get("model") or model_name,
-        "content": message.get("content") or "",
-        "reasoning": message.get("reasoning") or message.get("reasoning_content"),
+        "content": content,
+        "reasoning": reasoning,
         "usage": payload.get("usage"),
     }
+    if not content.strip():
+        # The model spent its budget on reasoning and never emitted an answer.
+        # Saying so beats returning an empty string that looks like a reply.
+        finish = choices[0].get("finish_reason")
+        result["empty_reason"] = (
+            f"no content; finish_reason={finish!r}. Raise max_tokens"
+            + (" (it has reasoning tokens)." if reasoning else ".")
+        )
+    return result
 
 
 # --------------------------------------------------------------------------- route
@@ -847,6 +966,9 @@ def route(
     )
     gate_answer = gate["answers"]["gate"]
     p_deep = float(gate_answer["noul"])
+    # The threshold alone decides. An emulated gate has no real probability, so
+    # flag it rather than silently letting a hard 0/1 pick the route.
+    gate_degraded = gate.get("backend") != "ollama-cloud"
     deep = p_deep >= gate_threshold
     if deep:
         asked = json.dumps(prepared, ensure_ascii=False)
@@ -873,6 +995,7 @@ def route(
             "threshold": gate_threshold,
             "uncertain": bool(gate_answer.get("escalate")),
             "uncertain_reason": gate_answer.get("escalate_reason"),
+            "degraded": gate_degraded,
         },
         "result": result,
         "escalate": escalate,
@@ -1030,7 +1153,7 @@ def _print_decide(out: dict[str, Any]) -> None:
         confidence = answer.get("confidence")
         shown = f" (conf {confidence:.2f})" if isinstance(confidence, float) else ""
         if answer["type"] == "choice":
-            print(f"{name}: {answer['choice']}{shown}")
+            print(f"{name}: {answer['choice'] or '(no label)'}{shown}")
         elif answer["type"] == "score":
             print(f"{name}: {answer['score']:.2f} -> {answer['answer']}{shown}")
         else:
@@ -1063,7 +1186,10 @@ def _run(args, cfg: dict[str, Any], parser: argparse.ArgumentParser) -> None:
         else:
             if out.get("reasoning"):
                 print(f"[reasoning] {out['reasoning'][:600]}\n")
-            print(out.get("content") or "(empty)")
+            if out.get("empty_reason"):
+                print(f"(empty) {out['empty_reason']}")
+            else:
+                print(out.get("content") or "(empty)")
     elif args.cmd == "route":
         questions = dict(parse_question_spec(spec) for spec in args.q) or None
         out = route(cfg, args.task, state=args.state, questions=questions,
@@ -1074,7 +1200,8 @@ def _run(args, cfg: dict[str, Any], parser: argparse.ArgumentParser) -> None:
             gate = out["gate"]
             p_deep = gate["p_deep"]
             shown = f"{p_deep:.3f}" if p_deep is not None else "  -  "
-            print(f"gate: p(deep)={shown} -> system {out['system']}")
+            degraded = " (gate degraded — routed deep)" if gate.get("degraded") else ""
+            print(f"gate: p(deep)={shown} -> system {out['system']}{degraded}")
             if out["system"] == "one":
                 _print_decide(out["result"])
             else:

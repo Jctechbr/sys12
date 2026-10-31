@@ -18,6 +18,7 @@ import base64
 import json
 import re
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -30,7 +31,7 @@ OCR_BIN = HERE / "ocr"
 LOG = HERE / "autoplay.log"
 JSONL = HERE / "autoplay.jsonl"
 PROFILE = Path.home() / "Library/Caches/sys12-chrome"
-SHOT = Path("/private/var/folders/mr/3fc4llxd4wj17hqrd_5xfqyc0000gn/T/opencode/shot.png")
+SHOT = Path(tempfile.gettempdir()) / "sys12-shot.png"
 
 CAP_JS = """() => { const c=document.querySelector('canvas');
   const o=document.createElement('canvas'); o.width=c.width; o.height=Math.floor(c.height*0.84);
@@ -424,7 +425,8 @@ def main() -> None:
 
     cfg = sys12.load_config()
     deadline = time.time() + args.minutes * 60
-    log(f"=== autoplay v2 start: system1={cfg['system1']} steps={args.steps} minutes={args.minutes} ===")
+    log(f"=== autoplay v2 start: system1={sys12.decision_model(cfg)} "
+        f"steps={args.steps} minutes={args.minutes} ===")
 
     with sync_playwright() as pw:
         ctx = pw.chromium.launch_persistent_context(

@@ -1,0 +1,2 @@
+# Optional browser extra: sys12_browse, autoplay.py, and diag_menu.py.
+playwright>=1.40,<2
