@@ -18,6 +18,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import sys12  # noqa: E402
 
+# The suite asserts exact call sequences, so retries are off by default here.
+# The retry tests below pass their own `retries` and a recording `sleep`.
+sys12.DEFAULT_RETRIES = 0
+
+
+def no_sleep(_seconds: float) -> None:
+    """Record nothing, wait for nothing: retries must not slow the suite."""
+    return None
+
 
 def cfg(**overrides) -> dict:
     base = {
@@ -603,6 +612,116 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(page.called, "max_steps=0 must still reach the page")
 
 
+class RetryTests(unittest.TestCase):
+    """Bounded retry on transient failures, and never on a fatal one."""
+
+    def _questions(self):
+        return {"q": {"type": "choice", "criteria": {"A": "x", "B": "y"}}}
+
+    def test_transient_failure_is_retried_then_succeeds(self) -> None:
+        calls: list[int] = []
+
+        def transport(url, body, token, timeout):
+            calls.append(1)
+            if len(calls) < 3:
+                raise sys12.UpstreamError(503, "HTTP 503: unavailable", True)
+            return choice_answer("A", 0.9)
+
+        with env_key():
+            out = sys12.decide(cfg(), "s", self._questions(), transport=transport,
+                               retries=2, sleep=no_sleep)
+        self.assertEqual(len(calls), 3, "two failures then success = 3 calls")
+        self.assertEqual(out["backend"], "ollama-cloud")
+        self.assertIsNone(out["fallback_reason"], "a retry that worked is not a fallback")
+
+    def test_retries_are_bounded_then_the_fallback_runs(self) -> None:
+        urls: list[str] = []
+
+        def transport(url, body, token, timeout):
+            urls.append(url)
+            if url.endswith("/v1/systemone"):
+                raise sys12.UpstreamError(503, "HTTP 503: down", True)
+            return chat_reply('{"q": "A"}')
+
+        with env_key():
+            out = sys12.decide(cfg(), "s", self._questions(), transport=transport,
+                               retries=2, sleep=no_sleep)
+        decision_calls = [u for u in urls if u.endswith("/v1/systemone")]
+        self.assertEqual(len(decision_calls), 3, "1 attempt + 2 retries")
+        self.assertEqual(out["backend"], "ollama-cloud-chat")
+
+    def test_fatal_error_is_never_retried(self) -> None:
+        calls: list[int] = []
+
+        def transport(url, body, token, timeout):
+            calls.append(1)
+            raise sys12.UpstreamError(401, "HTTP 401: bad key", False)
+
+        with env_key():
+            with self.assertRaises(sys12.UpstreamError):
+                sys12.decide(cfg(), "s", self._questions(), transport=transport,
+                             retries=5, sleep=no_sleep)
+        self.assertEqual(len(calls), 1, "a 401 must not be retried")
+
+    def test_backoff_grows_and_is_clamped(self) -> None:
+        self.assertEqual(sys12._retry_delay(0, sys12.UpstreamError(503, "", True)), 0.5)
+        self.assertEqual(sys12._retry_delay(1, sys12.UpstreamError(503, "", True)), 1.0)
+        self.assertEqual(sys12._retry_delay(2, sys12.UpstreamError(503, "", True)), 2.0)
+        self.assertLessEqual(
+            sys12._retry_delay(20, sys12.UpstreamError(503, "", True)),
+            sys12.RETRY_MAX_DELAY,
+        )
+
+    def test_server_retry_after_is_honoured_and_clamped(self) -> None:
+        exc = sys12.UpstreamError(429, '{"retry_after": 3}', True)
+        self.assertEqual(sys12._retry_delay(0, exc), 3.0)
+        huge = sys12.UpstreamError(429, '{"retry_after": 9999}', True)
+        self.assertEqual(sys12._retry_delay(0, huge), sys12.RETRY_MAX_DELAY)
+
+    def test_retries_zero_means_one_attempt_per_backend(self) -> None:
+        urls: list[str] = []
+
+        def transport(url, body, token, timeout):
+            urls.append(url)
+            raise sys12.UpstreamError(503, "down", True)
+
+        with env_key():
+            with self.assertRaises(sys12.Sys12Error):
+                sys12.decide(cfg(), "s", self._questions(), transport=transport,
+                             retries=0, sleep=no_sleep)
+        decision_calls = [u for u in urls if u.endswith("/v1/systemone")]
+        fallback_calls = [u for u in urls if u.endswith("/v1/chat/completions")]
+        self.assertEqual(len(decision_calls), 1, "retries=0 means no decision retry")
+        self.assertEqual(len(fallback_calls), 1, "and one fallback attempt, not a retry")
+
+    def test_retry_delay_is_actually_passed_to_sleep(self) -> None:
+        slept: list[float] = []
+
+        def transport(url, body, token, timeout):
+            raise sys12.UpstreamError(503, "down", True)
+
+        with env_key():
+            with self.assertRaises(sys12.Sys12Error):
+                sys12.decide(cfg(), "s", self._questions(), transport=transport,
+                             retries=2, sleep=slept.append)
+        self.assertEqual(slept, [0.5, 1.0], "two retries, exponential backoff")
+
+    def test_ask_retries_too(self) -> None:
+        calls: list[int] = []
+
+        def transport(url, body, token, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise sys12.UpstreamError(502, "HTTP 502", True)
+            return chat_reply("ok")
+
+        with env_key():
+            out = sys12.ask(cfg(), "hi", transport=transport, retries=1,
+                            sleep=no_sleep)
+        self.assertEqual(out["content"], "ok")
+        self.assertEqual(len(calls), 2)
+
+
 class McpSurfaceTests(unittest.TestCase):
     def test_server_exposes_five_prefixed_tools(self) -> None:
         import asyncio
@@ -633,6 +752,22 @@ class McpSurfaceTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             out = sys12_mcp.sys12_browse("https://example.com", "find a price")
         self.assertIn("SYS12_ALLOW_BROWSE", out["error"])
+
+    def test_browse_opt_in_rejects_falsy_values(self) -> None:
+        # Was: a bare truthiness check, so SYS12_ALLOW_BROWSE=0 enabled a browser.
+        import sys12_mcp
+
+        for value in ("0", "false", "no", "off", "", "  "):
+            with mock.patch.dict(os.environ, {"SYS12_ALLOW_BROWSE": value}):
+                out = sys12_mcp.sys12_browse("https://example.com", "goal")
+            self.assertIn("disabled", out["error"], f"{value!r} must not enable browse")
+
+    def test_browse_opt_in_accepts_truthy_values(self) -> None:
+        import sys12_mcp
+
+        for value in ("1", "true", "TRUE", "yes", "on"):
+            with mock.patch.dict(os.environ, {"SYS12_ALLOW_BROWSE": value}):
+                self.assertTrue(sys12_mcp._browse_enabled(), f"{value!r} should enable")
 
 
 if __name__ == "__main__":

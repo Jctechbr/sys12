@@ -200,6 +200,14 @@ def sys12_status() -> dict[str, Any]:
     return _safe(sys12.status)
 
 
+_BROWSE_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _browse_enabled() -> bool:
+    """Read the browse opt-in. ``SYS12_ALLOW_BROWSE=0`` must mean off."""
+    return os.environ.get("SYS12_ALLOW_BROWSE", "").strip().lower() in _BROWSE_TRUTHY
+
+
 @mcp.tool(
     annotations={
         "title": "System One browser navigation",
@@ -234,7 +242,7 @@ def sys12_browse(
         {"status": goal_reached|stuck|max_steps|needs_input, "stop_reason",
          "steps", "url", "title", "text", "answer"?}.
     """
-    if not os.environ.get("SYS12_ALLOW_BROWSE"):
+    if not _browse_enabled():
         return {
             "error": (
                 "sys12_browse is disabled. Set SYS12_ALLOW_BROWSE=1 in the MCP "

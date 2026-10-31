@@ -70,6 +70,23 @@ fallback exists to turn a failure into a usable hint, not to look confident.
 A **401, 402, 403, or 400 does not fall back.** Those are credential, billing,
 or request errors, and retrying the same key through chat would only fail twice.
 
+### Retries
+
+A transient failure is retried before any fallback: 429, 5xx, 408, 409, 425,
+timeouts, and connection resets. Backoff is exponential from `0.5 s`, capped at
+`8 s`, and a server `Retry-After` is honoured (also capped). The decision call
+gets **2 retries** (3 attempts); the chat fallback gets **1** extra attempt,
+because it is the last chance and the decision call has already spent the
+budget — giving both the same budget turns one failure into six network calls.
+
+Fatal errors (401/402/403/400) are never retried and never fall back.
+
+```bash
+./venv/bin/python sys12.py decide --state "..." --q "a:choice:x|y" --retries 0
+```
+
+`--retries N` overrides the budget on `decide`, `ask`, and `route`.
+
 ## Configuration
 
 `config.json` next to this file. Every key has an environment override.

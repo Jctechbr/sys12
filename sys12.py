@@ -303,20 +303,73 @@ def get_json(url: str, token: str, timeout: float) -> dict:
     return payload
 
 
+# Retries for a transient upstream failure. Only retryable errors are retried
+# (429, 5xx, 408, 409, 425, timeouts, connection resets); a 401 or a 400 is
+# never retried, because the same request against the same key cannot succeed.
+DEFAULT_RETRIES = 2
+# The chat fallback is the last chance, and the decision call has already spent
+# its retry budget. Giving it the same budget turns one failure into six network
+# calls and roughly double the backoff, so it gets one extra attempt at most.
+DEFAULT_FALLBACK_RETRIES = 1
+RETRY_BASE_DELAY = 0.5
+RETRY_MAX_DELAY = 8.0
+
+
+def _retry_after(detail: str) -> float | None:
+    """Read a Retry-After value out of an HTTP error body, if one is present."""
+    match = re.search(r'"retry_after"\s*:\s*"?([0-9.]+)', detail or "")
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def _retry_delay(attempt: int, exc: UpstreamError) -> float:
+    """Exponential backoff, clamped, honouring a server Retry-After."""
+    hinted = _retry_after(exc.detail)
+    if hinted is not None:
+        return max(0.0, min(hinted, RETRY_MAX_DELAY))
+    return min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+
+
 def _call(
     cfg: dict[str, Any],
     path: str,
     body: dict[str, Any],
     timeout: float,
     transport: Transport | None = None,
+    *,
+    retries: int | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
+    """POST with bounded retry on transient failures.
+
+    ``retries`` is the number of *additional* attempts. Pass 0 to disable, which
+    the tests do for the paths that assert a single call.
+    """
     token = cloud_key(cfg)
     url = cloud_base(cfg) + path
     runner = transport or post_json
-    try:
-        return runner(url, body, token, timeout)
-    except UpstreamError as exc:
-        raise UpstreamError(exc.status, _redact(exc.detail, [token]), exc.retryable) from None
+    attempts = DEFAULT_RETRIES if retries is None else max(0, int(retries))
+    pause = sleep or time.sleep
+    last: UpstreamError | None = None
+    for attempt in range(attempts + 1):
+        try:
+            return runner(url, body, token, timeout)
+        except UpstreamError as exc:
+            sanitized = UpstreamError(
+                exc.status, _redact(exc.detail, [token]), exc.retryable
+            )
+            last = sanitized
+            if not sanitized.retryable or attempt >= attempts:
+                raise sanitized from None
+            delay = _retry_delay(attempt, sanitized)
+            if delay:
+                pause(delay)
+    # Unreachable: the loop either returns or raises.
+    raise last if last else UpstreamError(None, "no attempt was made", False)
 
 
 # --------------------------------------------------------------------------- questions
@@ -652,6 +705,8 @@ def _decide_chat(
     transport: Transport | None,
     reason: str,
     fallback_model: str | None,
+    retries: int | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
     """Emulate System One on a chat model when /v1/systemone is unusable.
 
@@ -695,7 +750,9 @@ def _decide_chat(
         "temperature": 0,
     }
     started = time.perf_counter()
-    payload = _call(cfg, CHAT_PATH, body, timeout, transport)
+    payload = _call(cfg, CHAT_PATH, body, timeout, transport,
+                    retries=DEFAULT_FALLBACK_RETRIES if retries is None else 0,
+                    sleep=sleep)
     elapsed = int((time.perf_counter() - started) * 1000)
     text = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     emulated = _parse_emulated(questions, text)
@@ -821,12 +878,15 @@ def decide(
     *,
     transport: Transport | None = None,
     fallback_model: str | None = None,
+    retries: int | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
     """System One: structured judgment on Ollama Cloud.
 
-    Cloud /v1/systemone first. A retryable failure — or a 2xx that carries no
-    answers — falls back to one deterministic chat completion. Credential and
-    request errors do not fall back: retrying the same key only fails twice.
+    Cloud /v1/systemone first, with bounded retry on transient failures. If it
+    still fails — or returns a 2xx with no answers — one deterministic chat
+    completion stands in. Credential and request errors do not fall back or
+    retry: the same request against the same key cannot succeed.
     """
     prepared = normalize_questions(questions)
     prepared = apply_notes(prepared, notes)
@@ -841,7 +901,8 @@ def decide(
 
     started = time.perf_counter()
     try:
-        payload = _call(cfg, DECISION_PATH, body, timeout_value, transport)
+        payload = _call(cfg, DECISION_PATH, body, timeout_value, transport,
+                        retries=retries, sleep=sleep)
     except UpstreamError as exc:
         if not exc.retryable:
             # Keep the status and retryable flag: the caller needs to know this
@@ -850,6 +911,7 @@ def decide(
         return _decide_chat(
             cfg, state_text, prepared, timeout_value, images, transport,
             reason=str(exc), fallback_model=fallback_model,
+            retries=retries, sleep=sleep,
         )
     elapsed = int((time.perf_counter() - started) * 1000)
     try:
@@ -860,6 +922,7 @@ def decide(
         return _decide_chat(
             cfg, state_text, prepared, timeout_value, images, transport,
             reason=f"{exc}; fell back to chat", fallback_model=fallback_model,
+            retries=retries, sleep=sleep,
         )
 
 
@@ -876,6 +939,8 @@ def ask(
     timeout: float | None = None,
     *,
     transport: Transport | None = None,
+    retries: int | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
     """System Two: reasoning and generation on Ollama Cloud."""
     if not str(prompt or "").strip():
@@ -891,7 +956,8 @@ def ask(
     if temperature is not None:
         body["temperature"] = float(temperature)
     payload = _call(
-        cfg, CHAT_PATH, body, timeout or float(cfg.get("chat_timeout") or 300), transport
+        cfg, CHAT_PATH, body, timeout or float(cfg.get("chat_timeout") or 300),
+        transport, retries=retries, sleep=sleep,
     )
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -930,6 +996,8 @@ def route(
     timeout: float | None = None,
     *,
     transport: Transport | None = None,
+    retries: int | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
     """The switch: a NOUL gate on System One, then System One or System Two."""
     if not str(task or "").strip():
@@ -940,7 +1008,8 @@ def route(
     )
     context = f"\nContext: {state}" if state else ""
     if not questions:
-        result = ask(cfg, f"{task}{context}", timeout=timeout, transport=transport)
+        result = ask(cfg, f"{task}{context}", timeout=timeout, transport=transport,
+                     retries=retries, sleep=sleep)
         return {
             "system": "two",
             "gate": {
@@ -963,6 +1032,8 @@ def route(
                   "criteria": {"true": GATE_TRUE, "false": GATE_FALSE}}},
         timeout=timeout,
         transport=transport,
+        retries=retries,
+        sleep=sleep,
     )
     gate_answer = gate["answers"]["gate"]
     p_deep = float(gate_answer["noul"])
@@ -978,12 +1049,15 @@ def route(
             f"use the option text, not the letter: {asked}",
             timeout=timeout,
             transport=transport,
+            retries=retries,
+            sleep=sleep,
         )
         system = "two"
         escalate = False
     else:
         result = decide(
-            cfg, gate_state, prepared, timeout=timeout, transport=transport
+            cfg, gate_state, prepared, timeout=timeout, transport=transport,
+            retries=retries, sleep=sleep,
         )
         system = "one"
         escalate = bool(result.get("escalate"))
@@ -1095,6 +1169,8 @@ def main() -> None:
     p.add_argument("--image", action="append", default=[], metavar="PATH",
                    help="image file for a vision decision model, repeatable")
     p.add_argument("--model", default=None)
+    p.add_argument("--retries", type=int, default=None,
+                   help="retries for a transient failure (0 disables, default 2)")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("ask", help="System Two: chat completion")
@@ -1103,6 +1179,8 @@ def main() -> None:
     p.add_argument("--system", default=None)
     p.add_argument("--max-tokens", type=int, default=None)
     p.add_argument("--temperature", type=float, default=None)
+    p.add_argument("--retries", type=int, default=None,
+                   help="retries for a transient failure (0 disables, default 2)")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("route", help="the switch: gate on System One, escalate to System Two")
@@ -1110,6 +1188,8 @@ def main() -> None:
     p.add_argument("--state", default=None)
     p.add_argument("--q", action="append", default=[], metavar="NAME:TYPE:A|B|C")
     p.add_argument("--threshold", type=float, default=None)
+    p.add_argument("--retries", type=int, default=None,
+                   help="retries for a transient failure (0 disables, default 2)")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("status", help="oMLX models, memory, and cloud routing")
@@ -1173,6 +1253,7 @@ def _run(args, cfg: dict[str, Any], parser: argparse.ArgumentParser) -> None:
             cfg, args.state, questions, model=args.model,
             images=images_from_paths(args.image),
             notes=_notes_from_args(args.note),
+            retries=args.retries,
         )
         if args.json:
             print(json.dumps(out, indent=2, ensure_ascii=False))
@@ -1180,7 +1261,8 @@ def _run(args, cfg: dict[str, Any], parser: argparse.ArgumentParser) -> None:
             _print_decide(out)
     elif args.cmd == "ask":
         out = ask(cfg, args.prompt, model=args.model, system=args.system,
-                  max_tokens=args.max_tokens, temperature=args.temperature)
+                  max_tokens=args.max_tokens, temperature=args.temperature,
+                  retries=args.retries)
         if args.json:
             print(json.dumps(out, indent=2, ensure_ascii=False))
         else:
@@ -1193,7 +1275,7 @@ def _run(args, cfg: dict[str, Any], parser: argparse.ArgumentParser) -> None:
     elif args.cmd == "route":
         questions = dict(parse_question_spec(spec) for spec in args.q) or None
         out = route(cfg, args.task, state=args.state, questions=questions,
-                    threshold=args.threshold)
+                    threshold=args.threshold, retries=args.retries)
         if args.json:
             print(json.dumps(out, indent=2, ensure_ascii=False))
         else:
