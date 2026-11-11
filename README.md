@@ -103,16 +103,14 @@ Fatal errors (401/402/403/400) are never retried and never fall back.
 
 `cloud_key()` tries three sources, in order:
 
-1. `OLLAMA_API_KEY` in the environment.
-2. The macOS Keychain item **`ollama-clef`**, account = the login user. On this
-   Mac the secret is the **Cursor API Key** field of the Bitwarden item
-   "Ollama (Corporativo)". This is the default path and needs no setup here.
-3. `~/.config/sys12/ollama.env`, containing `OLLAMA_API_KEY=...`.
+1. The environment variable named by `cloud.api_key_env` (`OLLAMA_API_KEY` by default).
+2. A macOS Keychain generic password. The service name is `cloud.keychain_service`. The account is the login user.
+3. The file at `cloud.api_key_file`, containing a line `OLLAMA_API_KEY=...`.
 
-To store the Keychain item on a new machine:
+To store the Keychain item, use the same service name as `cloud.keychain_service`:
 
 ```bash
-security add-generic-password -s ollama-clef -a "$(id -un)" -w '<key>' -U
+security add-generic-password -s '<keychain-service>' -a "$(id -un)" -w '<key>' -U
 ```
 
 If all three are absent, the call fails with a message naming all three. It does
@@ -208,7 +206,7 @@ python3 -m venv venv
 ./venv/bin/python -m unittest discover -s tests    # 63 tests, no network
 ```
 
-Key: nothing to do on this Mac (Keychain `ollama-clef`). See above for a new one.
+Key: set `OLLAMA_API_KEY`, the Keychain service named in `config.json`, or the key file. See above.
 
 Run the MCP server manually:
 

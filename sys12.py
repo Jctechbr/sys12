@@ -199,10 +199,9 @@ def _key_from_file(path: str, name: str) -> str:
 def cloud_key(cfg: dict[str, Any] | None = None) -> str:
     """Environment first, then the macOS Keychain, then an optional key file.
 
-    The Keychain item is the default on this Mac: service ``ollama-clef``,
-    account the login user, secret the Cursor API Key from the Bitwarden item
-    "Ollama (Corporativo)". A machine without that item can export
-    ``OLLAMA_API_KEY`` or drop a key file at ``cloud.api_key_file``.
+    The Keychain service name is ``cloud.keychain_service`` and the account
+    is the login user. Otherwise export the variable named by
+    ``cloud.api_key_env``, or write that variable into ``cloud.api_key_file``.
     """
     cfg = cfg or load_config()
     cloud = cfg["cloud"]
